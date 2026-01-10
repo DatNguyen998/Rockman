@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Megaman-like Side Scroller (Boss Stage)</title>
+
+<!--
+GENRE
+- 2D Side-scrolling Shooter (Megaman-like, original)
+
+FIX & EXTENSION NOTES
+- Fixed bug where player disappeared at end of map:
+  + Camera is now clamped to LEVEL_PIXEL_WIDTH - CANVAS_WIDTH
+  + Player X is clamped inside level bounds
+- Added:
+  + Multiple enemies spawned via level data
+  + End-level BOSS with HP bar & simple AI
+  + Clear separation between normal stage and boss arena
+
+ARCHITECTURE
+- requestAnimationFrame + deltaTime
+- Finite State Machine (MENU / PLAYING / GAMEOVER / WIN)
+- Tilemap-based level (2D array)
+- AABB collision engine
+- Object Pooling for bullets
+- Camera system with hard clamp
+-->
+
+<style>
+  body { margin:0; background:#0b0b0b; overflow:hidden; }
+  canvas { display:block; margin:0 auto; background:#111; }
+</style>
+</head>
+<body>
+<canvas id="game" width="960" height="540"></canvas>
+
+<script>
+/* ======================================================
+   CORE SETUP
+====================================================== */
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const WIDTH = canvas.width;
+const HEIGHT = canvas.height;
+const TILE = 32;
+
+/* ======================================================
+   GAME STATE
+====================================================== */
+const STATE = { MENU:0, PLAYING:1, GAMEOVER:2, WIN:3 };
+let gameState = STATE.MENU;
+
+/* ======================================================
+   INPUT
+====================================================== */
+const keys = {};
+addEventListener("keydown", e => keys[e.key.toLowerCase()] = true);
+addEventListener("keyup", e => keys[e.key.toLowerCase()] = false);
+
+/* ======================================================
+   AUDIO (Procedural)
+====================================================== */
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+function beep(freq=440, dur=0.05){
+  const o = audioCtx.createOscillator();
+  const g = audioCtx.createGain();
+  o.type="square"; o.frequency.value=freq;
+  g.gain.value=0.08;
+  o.connect(g).connect(audioCtx.destination);
+  o.start(); o.stop(audioCtx.currentTime+dur);
+}
+
+/* ======================================================
+   TILEMAP (WIDER LEVEL)
+====================================================== */
+const level = [
+"000000000000000000000000000000000000000000000000000000",
+"000000000000000000000000000000000000000000000000000000",
+"000000000000000000000000000000000000000000000000000000",
+"000000000001111000000000001111000000000001111000000000",
+"000000000000000000000000000000000000000000000000000000",
+"000001111000000000111100000000000000111100000000000000",
+"000000000000000000000000000000000000000000000000000000",
+"000000000000000000000000000000000000000000000000000000",
+"000000000000000000000000000000000000000000000000000000",
+"111111111111111111111111111111111111111111111111111111"
+].map(r=>r.split("").map(Number));
+
+const MAP_W = level[0].length;
+const MAP_H = level.length;
+const LEVEL_PIXEL_WIDTH = MAP_W * TILE;
+
+/* ======================================================
+   CAMERA SYSTEM
+   - Follows player
+   - Clamped to level bounds (FIXES DISAPPEAR BUG)
+====================================================== */
+const camera = { x:0 };
+
+function clamp(v,min,max){ return Math.max(min,Math.min(max,v)); }
+
+/* ======================================================
+   COLLISION
+====================================================== */
+function aabb(a,b){
+  return a.x<a.x+a.w &&
+         a.x+a.w>b.x &&
+         a.y<b.y+b.h &&
+         a.y+a.h>b.y;
+}
+function tileAt(px,py){
+  const x=Math.floor(px/TILE);
+  const y=Math.floor(py/TILE);
+  if(x<0||y<0||x>=MAP_W||y>=MAP_H) return 1;
+  return level[y][x];
+}
+
+/* ======================================================
+   OBJECT POOLING (BULLETS)
+====================================================== */
+const bullets=[];
+for(let i=0;i<50;i++)
+  bullets.push({active:false,x:0,y:0,vx:0,w:8,h:4,from:"player"});
+
+function shoot(x,y,dir,from){
+  const b=bullets.find(b=>!b.active);
+  if(!b) return;
+  b.active=true;
+  b.x=x; b.y=y;
+  b.vx=dir*600;
+  b.from=from;
+  beep(from==="player"?800:300);
+}
+
+/* ======================================================
+   PARTICLES
+====================================================== */
+const particles=[];
+function explode(x,y){
+  for(let i=0;i<12;i++)
+    particles.push({
+      x,y,
+      vx:(Math.random()-0.5)*250,
+      vy:(Math.random()-0.5)*250,
+      life:0.6
+    });
+}
+
+/* ======================================================
+   PLAYER
+====================================================== */
+const player={
+  x:64,y:0,w:26,h:32,
+  vx:0,vy:0,dir:1,
+  speed:240,jump:520,
+  onGround:false,
+  hp:100,inv:0,
+  coyote:0,buffer:0
+};
+
+/* ======================================================
+   ENEMIES (MANY)
+====================================================== */
+const enemies=[];
+for(let i=300;i<LEVEL_PIXEL_WIDTH-400;i+=350){
+  enemies.push({type:1,x:i,y:0,w:26,h:26,vx:70,dir:1,hp:30});
+}
+for(let i=500;i<LEVEL_PIXEL_WIDTH-600;i+=600){
+  enemies.push({type:2,x:i,y:0,w:26,h:26,t:0,cd:1.8,hp:40});
+}
+
+/* ======================================================
+   BOSS (END OF LEVEL)
+====================================================== */
+const boss={
+  active:false,
+  x:LEVEL_PIXEL_WIDTH-300,
+  y:0,
+  w:80,h:80,
+  hp:300,
+  dir:-1,
+  shoot:0
+};
+
+/* ======================================================
+   UPDATE
+====================================================== */
+function update(dt){
+  /* PLAYER INPUT */
+  player.vx=0;
+  if(keys["arrowleft"]){player.vx=-player.speed;player.dir=-1;}
+  if(keys["arrowright"]){player.vx=player.speed;player.dir=1;}
+  if(keys["z"]) player.buffer=0.15;
+  if(keys["x"]) shoot(player.x+player.w/2,player.y+16,player.dir,"player");
+
+  /* PHYSICS */
+  player.vy+=1600*dt;
+  player.x+=player.vx*dt;
+  player.y+=player.vy*dt;
+
+  player.x=clamp(player.x,0,LEVEL_PIXEL_WIDTH-player.w);
+
+  player.onGround=false;
+  const by=player.y+player.h;
+  if(tileAt(player.x+2,by)||tileAt(player.x+player.w-2,by)){
+    player.y=Math.floor(by/TILE)*TILE-player.h;
+    player.vy=0;player.onGround=true;player.coyote=0.1;
+  }
+
+  if(player.buffer>0&&(player.onGround||player.coyote>0)){
+    player.vy=-player.jump;player.buffer=0;beep(500);
+  }
+  player.coyote-=dt;player.buffer-=dt;
+  if(player.inv>0) player.inv-=dt;
+
+  /* BULLETS */
+  bullets.forEach(b=>{
+    if(!b.active) return;
+    b.x+=b.vx*dt;
+    if(tileAt(b.x,b.y)) b.active=false;
+
+    if(b.from==="player"){
+      enemies.forEach(e=>{
+        if(e.hp>0 && aabb(b,e)){
+          e.hp-=10;b.active=false;explode(e.x,e.y);
+        }
+      });
+      if(boss.active && boss.hp>0 && aabb(b,boss)){
+        boss.hp-=5;b.active=false;explode(b.x,b.y);
+      }
+    }
+  });
+
+  /* ENEMIES */
+  enemies.forEach(e=>{
+    if(e.hp<=0) return;
+    if(e.type===1){
+      e.x+=e.vx*e.dir*dt;
+      if(tileAt(e.x,e.y+e.h+2)===0) e.dir*=-1;
+    }
+    if(e.type===2){
+      e.t+=dt;
+      if(e.t>e.cd){
+        shoot(e.x,e.y+12,player.x>e.x?1:-1,"enemy");
+        e.t=0;
+      }
+    }
+    if(aabb(player,e)&&player.inv<=0){
+      player.hp-=20;player.inv=1;beep(100);
+    }
+  });
+
+  /* BOSS ACTIVATION */
+  if(player.x>LEVEL_PIXEL_WIDTH-500) boss.active=true;
+
+  if(boss.active && boss.hp>0){
+    boss.shoot+=dt;
+    boss.x+=boss.dir*80*dt;
+    if(boss.shoot>1.2){
+      shoot(boss.x,boss.y+40,player.x>boss.x?1:-1,"enemy");
+      boss.shoot=0;
+    }
+    if(aabb(player,boss)&&player.inv<=0){
+      player.hp-=30;player.inv=1;
+    }
+  }
+
+  /* PARTICLES */
+  for(let i=particles.length-1;i>=0;i--){
+    const p=particles[i];
+    p.life-=dt;
+    p.x+=p.vx*dt;p.y+=p.vy*dt;
+    if(p.life<=0) particles.splice(i,1);
+  }
+
+  /* CAMERA CLAMP (IMPORTANT FIX) */
+  camera.x=clamp(player.x-WIDTH/2,0,LEVEL_PIXEL_WIDTH-WIDTH);
+
+  if(player.hp<=0) gameState=STATE.GAMEOVER;
+  if(boss.active && boss.hp<=0) gameState=STATE.WIN;
+}
+
+/* ======================================================
+   DRAW
+====================================================== */
+function draw(){
+  ctx.clearRect(0,0,WIDTH,HEIGHT);
+  ctx.save();
+  ctx.translate(-camera.x,0);
+
+  ctx.fillStyle="#333";
+  for(let y=0;y<MAP_H;y++)
+    for(let x=0;x<MAP_W;x++)
+      if(level[y][x])
+        ctx.fillRect(x*TILE,y*TILE,TILE,TILE);
+
+  if(player.inv<=0||Math.floor(player.inv*10)%2===0){
+    ctx.fillStyle="#4da6ff";
+    ctx.fillRect(player.x,player.y,player.w,player.h);
+  }
+
+  enemies.forEach(e=>{
+    if(e.hp>0){
+      ctx.fillStyle=e.type===1?"#ff5555":"#b266ff";
+      ctx.fillRect(e.x,e.y,e.w,e.h);
+    }
+  });
+
+  if(boss.active && boss.hp>0){
+    ctx.fillStyle="#ffaa00";
+    ctx.fillRect(boss.x,boss.y,boss.w,boss.h);
+  }
+
+  ctx.fillStyle="#ffd966";
+  bullets.forEach(b=>{if(b.active)ctx.fillRect(b.x,b.y,b.w,b.h);});
+
+  ctx.fillStyle="#fff";
+  particles.forEach(p=>ctx.fillRect(p.x,p.y,2,2));
+
+  ctx.restore();
+
+  ctx.fillStyle="#fff";
+  ctx.fillText("HP: "+player.hp,20,30);
+
+  if(boss.active){
+    ctx.fillStyle="#f00";
+    ctx.fillRect(WIDTH/2-150,20,300*(boss.hp/300),8);
+  }
+}
+
+/* ======================================================
+   LOOP
+====================================================== */
+let last=performance.now();
+function loop(t){
+  const dt=Math.min((t-last)/1000,0.033);
+  last=t;
+
+  if(gameState===STATE.MENU){
+    ctx.fillStyle="#fff";
+    ctx.fillText("PRESS ANY KEY",WIDTH/2-70,HEIGHT/2);
+    if(Object.values(keys).some(v=>v)) gameState=STATE.PLAYING;
+  }
+  else if(gameState===STATE.PLAYING){
+    update(dt); draw();
+  }
+  else if(gameState===STATE.GAMEOVER){
+    ctx.fillStyle="#f55";
+    ctx.fillText("GAME OVER",WIDTH/2-50,HEIGHT/2);
+  }
+  else{
+    ctx.fillStyle="#5f5";
+    ctx.fillText("YOU WIN!",WIDTH/2-40,HEIGHT/2);
+  }
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
