@@ -1,7 +1,6 @@
 # megaman-like-vibing
-# megaman-like-vibing
 
-Refine the prompts modal of Megaman until finalize the game mechanism
+Refine the prompts modal of Megaman until it finalizes the game mechanism
 
 # Role: Senior HTML5 Game Developer & Pixel Artist
 # Task: Create a fully functional "Mega Man" clone in a SINGLE HTML file (HTML + CSS + Vanilla JS).
