@@ -1,5 +1,7 @@
-# megaman-like-vibing
+# megaman-generation
 
+Prompt detail:
+```yaml
 Refine the prompts modal of Megaman until it finalizes the game mechanism
 
 # Role: Senior HTML5 Game Developer & Pixel Artist
